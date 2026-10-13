@@ -832,13 +832,16 @@ export default defineComponent({
 						displayname: file.displayname,
 						mime: file.mime,
 						mtime: new Date(file.lastmod),
+						size: file.size,
 						owner: this.currentFile.ownerId,
 						root: getRootPath(),
+						attributes: { favorite: file.favorite ? 1 : 0 },
 					}),
 				)
 				const sortedNodes = sortNodes(nodes, {
 					sortingMode: this.sortingConfig.key,
 					sortingOrder: this.sortingConfig.asc ? 'asc' : 'desc',
+					sortFavoritesFirst: this.sortingConfig.favoritesFirst,
 				})
 
 				const filesByPath = new Map(
