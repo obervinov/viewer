@@ -42,7 +42,7 @@
 		:enable-swipe="canSwipe && !editing"
 		:has-next="hasNext"
 		:has-previous="hasPrevious"
-		:inline-actions="canEdit ? 1 : 0"
+		:inline-actions="inlineActionsCount"
 		:spread-navigation="true"
 		:style="{ width: isSidebarShown ? `${sidebarPosition}px` : null }"
 		:name="currentFile.basename"
@@ -61,6 +61,23 @@
 					<Pencil :size="20" />
 				</template>
 				{{ t('viewer', 'Edit') }}
+			</NcActionButton>
+			<NcActionButton v-if="canFavorite"
+				:close-after-click="true"
+				@click="onToggleFavorite">
+				<template #icon>
+					<Star v-if="isFavorite" :size="20" />
+					<StarOutline v-else :size="20" />
+				</template>
+				{{ isFavorite ? t('files', 'Remove from favorites') : t('files', 'Add to favorites') }}
+			</NcActionButton>
+			<NcActionButton v-if="canManageTags"
+				:close-after-click="true"
+				@click="onManageTags">
+				<template #icon>
+					<TagMultipleOutline :size="20" />
+				</template>
+				{{ t('systemtags', 'Manage tags') }}
 			</NcActionButton>
 			<!-- Menu items -->
 			<NcActionButton :close-after-click="true"
@@ -182,7 +199,7 @@ import Vue, { defineComponent } from 'vue'
 
 import { emit, subscribe, unsubscribe } from '@nextcloud/event-bus'
 import { loadState } from '@nextcloud/initial-state'
-import { File as NcFile, Node, sortNodes } from '@nextcloud/files'
+import { File as NcFile, Node, getFileActions, getNavigation, sortNodes } from '@nextcloud/files'
 import { defaultRemoteURL, defaultRootPath, getRootPath } from '@nextcloud/files/dav'
 import { showError } from '@nextcloud/dialogs'
 import axios from '@nextcloud/axios'
@@ -209,6 +226,9 @@ import Fullscreen from 'vue-material-design-icons/Fullscreen.vue'
 import FullscreenExit from 'vue-material-design-icons/FullscreenExit.vue'
 import Pencil from 'vue-material-design-icons/PencilOutline.vue'
 import DockRight from 'vue-material-design-icons/DockRight.vue'
+import Star from 'vue-material-design-icons/Star.vue'
+import StarOutline from 'vue-material-design-icons/StarOutline.vue'
+import TagMultipleOutline from 'vue-material-design-icons/TagMultipleOutline.vue'
 
 import '@nextcloud/dialogs/style.css'
 
@@ -231,6 +251,9 @@ export default defineComponent({
 		NcActionLink,
 		NcModal,
 		Pencil,
+		Star,
+		StarOutline,
+		TagMultipleOutline,
 	},
 
 	mixins: [isFullscreen, isMobile],
@@ -278,6 +301,12 @@ export default defineComponent({
 			handlerId: '',
 
 			trapElements: [],
+
+			// Files app actions on the current file (favorite, tags)
+			canFavorite: false,
+			canManageTags: false,
+			isFavorite: false,
+			favoriteLoading: false,
 		}
 	},
 
@@ -401,6 +430,10 @@ export default defineComponent({
 			return !this.isMobile
 		},
 
+		inlineActionsCount() {
+			return [this.canEdit, this.canFavorite, this.canManageTags].filter(Boolean).length
+		},
+
 		contentClass() {
 			return {
 				'viewer--split': this.comparisonFile,
@@ -435,6 +468,10 @@ export default defineComponent({
 	},
 
 	watch: {
+		currentFile() {
+			this.refreshCurrentNode()
+		},
+
 		fileList(fileList) {
 			if (fileList.length > 1) {
 				this.beginSlideshow()
@@ -569,6 +606,7 @@ export default defineComponent({
 		window.addEventListener('keydown', this.keyboardDeleteFile)
 		window.addEventListener('keydown', this.keyboardDownloadFile)
 		window.addEventListener('keydown', this.keyboardEditFile)
+		window.addEventListener('keydown', this.keyboardFileActions)
 		this.addFullscreenEventListeners()
 	},
 
@@ -585,6 +623,7 @@ export default defineComponent({
 		window.removeEventListener('keydown', this.keyboardDeleteFile)
 		window.removeEventListener('keydown', this.keyboardDownloadFile)
 		window.removeEventListener('keydown', this.keyboardEditFile)
+		window.removeEventListener('keydown', this.keyboardFileActions)
 		this.removeFullscreenEventListeners()
 	},
 
@@ -1074,11 +1113,42 @@ export default defineComponent({
 			}
 		},
 
+		// S toggles the favorite, T opens the tag picker, like the Files list hotkeys
+		// (those are muted while the viewer modal is open). Matched on the physical key
+		// so they also work on non-latin keyboard layouts.
+		keyboardFileActions(event) {
+			if (event.ctrlKey || event.metaKey || event.altKey || event.shiftKey || this.editing) {
+				return
+			}
+			const target = event.target
+			if (target instanceof HTMLInputElement
+				|| target instanceof HTMLTextAreaElement
+				|| target instanceof HTMLSelectElement
+				|| target?.isContentEditable) {
+				return
+			}
+			// Another dialog (e.g. the tag picker) is open on top of the viewer
+			const openModals = Array.from(document.getElementsByClassName('modal-mask'))
+				.filter(el => el.checkVisibility?.() ?? true)
+			if (openModals.length > 1) {
+				return
+			}
+
+			if (event.code === 'KeyS' && this.canFavorite) {
+				event.preventDefault()
+				this.onToggleFavorite()
+			} else if (event.code === 'KeyT' && this.canManageTags) {
+				event.preventDefault()
+				this.onManageTags()
+			}
+		},
+
 		cleanup() {
 			logger.info('Cleaning up viewer')
 
 			// reset all properties
 			this.currentFile = {}
+			this.currentNode = null
 			this.comparisonFile = null
 			this.currentModal = null
 			this.fileList = []
@@ -1207,12 +1277,107 @@ export default defineComponent({
 		async handleFileUpdated(node) {
 			const index = this.fileList.findIndex(({ fileid: currentFileId }) => currentFileId === node.fileid)
 
-			// Ensure compatibility with the legacy data model that the Viewer is using. (see "model.ts").
+			// Merge the changes into the legacy fileInfo instead of replacing it with the Node:
+			// the rest of the Viewer reads fileInfo fields (filename, …) a Node does not have,
+			// so a replaced entry could not be opened again on previous/next.
 			// This can be removed once Viewer is migrated to the new Node API.
-			node.etag = node.attributes.etag
-			this.fileList.splice(index, 1, node)
+			if (index !== -1) {
+				this.fileList.splice(index, 1, {
+					...this.fileList[index],
+					etag: node.attributes.etag,
+					favorite: node.attributes.favorite,
+				})
+			}
 			if (node.fileid === this.currentFile.fileid) {
 				this.currentFile.etag = node.attributes.etag
+				if (this.currentNode && node !== this.currentNode) {
+					this.refreshCurrentNode()
+				} else {
+					this.isFavorite = node.attributes.favorite === 1
+				}
+			}
+		},
+
+		/**
+		 * Load the current file as a Node for the Files app actions and check which of them apply.
+		 * The Node is kept out of the reactive data on purpose, Vue 2 must not observe it.
+		 */
+		async refreshCurrentNode() {
+			const file = this.currentFile
+			this.currentNode = null
+			this.canFavorite = false
+			this.canManageTags = false
+			this.isFavorite = false
+
+			if (!file?.filename || (!this.getFileAction('favorite') && !this.getFileAction('systemtags:bulk'))) {
+				return
+			}
+
+			try {
+				const node = await fetchNode(file.filename)
+				// Another file was opened in the meantime
+				if (file !== this.currentFile) {
+					return
+				}
+				this.currentNode = node
+				const context = this.fileActionContext(node)
+				this.canFavorite = !!this.getFileAction('favorite')?.enabled?.(context)
+				this.canManageTags = !!this.getFileAction('systemtags:bulk')?.enabled?.(context)
+				this.isFavorite = node.attributes.favorite === 1
+			} catch (error) {
+				logger.debug('Could not load the current file for the Files actions', { error })
+			}
+		},
+
+		getFileAction(id) {
+			return getFileActions().find(action => action.id === id)
+		},
+
+		fileActionContext(node) {
+			return {
+				nodes: [node],
+				view: getNavigation().active ?? { id: 'files' },
+				// Only the path is read, to detect the virtual root of the favorites view
+				folder: { path: node.dirname },
+				contents: [],
+			}
+		},
+
+		async onToggleFavorite() {
+			const node = this.currentNode
+			const action = this.getFileAction('favorite')
+			if (!node || !action || this.favoriteLoading) {
+				return
+			}
+			this.favoriteLoading = true
+			try {
+				// The action updates node.attributes.favorite and emits files:node:updated
+				const success = await action.exec(this.fileActionContext(node))
+				if (success === false) {
+					showError(this.t('viewer', 'Could not update the favorite'))
+				}
+				if (node === this.currentNode) {
+					this.isFavorite = node.attributes.favorite === 1
+				}
+			} catch (error) {
+				logger.error('Could not toggle the favorite', { error })
+				showError(error)
+			} finally {
+				this.favoriteLoading = false
+			}
+		},
+
+		async onManageTags() {
+			const node = this.currentNode
+			const action = this.getFileAction('systemtags:bulk')
+			if (!node || !action) {
+				return
+			}
+			try {
+				await action.exec(this.fileActionContext(node))
+			} catch (error) {
+				logger.error('Could not open the tag picker', { error })
+				showError(error)
 			}
 		},
 
