@@ -199,7 +199,7 @@ import Vue, { defineComponent } from 'vue'
 
 import { emit, subscribe, unsubscribe } from '@nextcloud/event-bus'
 import { loadState } from '@nextcloud/initial-state'
-import { File as NcFile, Node, getFileActions, getNavigation, sortNodes } from '@nextcloud/files'
+import { File as NcFile, Node, getFileActions, getNavigation, getSidebar, sortNodes } from '@nextcloud/files'
 import { defaultRemoteURL, defaultRootPath, getRootPath } from '@nextcloud/files/dav'
 import { showError } from '@nextcloud/dialogs'
 import axios from '@nextcloud/axios'
@@ -1233,6 +1233,9 @@ export default defineComponent({
 		 * Show the sharing sidebar
 		 */
 		async showSidebar() {
+			if (this.enableSidebar && await this.openFilesSidebar()) {
+				return
+			}
 			if (this.enableSidebar) {
 				// TODO remove when we finally use the node API
 				const node = new NcFile({
@@ -1252,6 +1255,36 @@ export default defineComponent({
 					// TODO: also hide figure, needs a proper method for it in server Sidebar
 					await OCA.Files.Sidebar.open(this.sidebarOpenFilePath)
 				}
+			}
+		},
+
+		/**
+		 * Open the Files sidebar on the Activity tab, or keep the current tab when it is
+		 * already open (previous/next). viewer:sidebar:open cannot pass a tab, and the
+		 * Files sidebar then always starts on Sharing.
+		 *
+		 * @return {Promise<boolean>} false when the sidebar could not be opened this way
+		 */
+		async openFilesSidebar() {
+			const sidebar = getSidebar()
+			if (!sidebar.available || !this.currentFile?.filename) {
+				return false
+			}
+			// Read before awaiting: Files reopens the sidebar on Sharing for the new file meanwhile
+			const tab = this.isSidebarShown ? sidebar.activeTab : 'activity'
+			try {
+				const file = this.currentFile
+				const node = await fetchNode(file.filename)
+				// Another file was opened in the meantime, it opens the sidebar itself
+				if (file !== this.currentFile) {
+					return true
+				}
+				// An unavailable tab (e.g. activity app disabled) falls back to the first one
+				sidebar.open(node, tab)
+				return true
+			} catch (error) {
+				logger.debug('Could not open the Files sidebar directly', { error })
+				return false
 			}
 		},
 
